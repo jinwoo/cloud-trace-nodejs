@@ -21,12 +21,7 @@ import * as http2 from 'http2';
 import * as shimmer from 'shimmer';
 import {URL} from 'url';
 
-import {TraceAgent} from '../plugin-types';
-
-// type of ClientHttp2Session#request()
-type Http2SessionRequestFunction =
-    (this: http2.ClientHttp2Session, headers?: http2.OutgoingHttpHeaders,
-     options?: http2.ClientSessionRequestOptions) => http2.ClientHttp2Stream;
+import {RootSpanOptions, TraceAgent} from '../plugin-types';
 
 function getSpanName(authority: string|URL): string {
   if (typeof authority === 'string') {
@@ -63,8 +58,8 @@ function isTraceAgentRequest(
 }
 
 function makeRequestTrace(
-    request: Http2SessionRequestFunction, authority: string|URL,
-    api: TraceAgent): Http2SessionRequestFunction {
+    session: http2.ClientHttp2Session, request: typeof session.request,
+    authority: string|URL, api: TraceAgent): typeof session.request {
   return function(
              this: http2.Http2Session,
              headers?: http2.OutgoingHttpHeaders): http2.ClientHttp2Stream {
@@ -134,12 +129,9 @@ function makeRequestTrace(
     // any of the official documentation.
     shimmer.wrap(
         stream, 'on',
-        function(
-            this: http2.ClientHttp2Stream,
-            on: (this: EventEmitter, eventName: {}, listener: Function) =>
-                EventEmitter) {
-          return function(
-              this: http2.ClientHttp2Stream, eventName: {}, cb: Function) {
+        (on: (this: EventEmitter, eventName: {}, listener: Function) =>
+             EventEmitter) => {
+          return function(this: http2.ClientHttp2Stream, eventName: {}) {
             if (eventName === 'data' && !listenerAttached) {
               listenerAttached = true;
               on.call(this, 'data', (chunk: Buffer|string) => {
@@ -153,29 +145,160 @@ function makeRequestTrace(
   };
 }
 
-function patchHttp2Session(
-    session: http2.Http2Session, authority: string|URL, api: TraceAgent): void {
+function patchClientHttp2Session(
+    session: http2.ClientHttp2Session, authority: string|URL,
+    api: TraceAgent): void {
   api.wrapEmitter(session);
   shimmer.wrap(
       session, 'request',
-      (request: Http2SessionRequestFunction) =>
-          makeRequestTrace(request, authority, api));
+      (request: typeof session.request) =>
+          makeRequestTrace(session, request, authority, api));
+}
+
+function constructUrl(headers: http2.IncomingHttpHeaders): string {
+  // :method, :scheme, and :path are mandatory in http2 spec:
+  // https://tools.ietf.org/html/rfc7540#section-8.1.2.3
+  const protocol = headers[':scheme'] as string;
+  const host = headers[':authority'] || headers['host'] || 'localhost';
+  const url = new URL(`${protocol}://${host}`);
+  url.host = host as string;
+  url.pathname = headers[':path'] as string;
+  return url.toString();
+}
+
+function constructStatusCode(headers?: http2.OutgoingHttpHeaders): number {
+  let status: number|undefined;
+  if (headers) {
+    const statusVal = headers[':status'] as string | number | undefined;
+    if (statusVal) {
+      status = Number(statusVal);
+    }
+  }
+  return status || 200;
+}
+
+function patchHttp2Server(
+    server: http2.Http2Server|http2.Http2SecureServer, api: TraceAgent): void {
+  server.on('stream', (stream, headers, flags) => {
+    const reqPath: string = headers[':path'] as string;
+    const options: RootSpanOptions = {
+      name: reqPath,
+      traceContext: headers[api.constants.TRACE_CONTEXT_HEADER_NAME] as string |
+          undefined,
+      url: reqPath,
+    };
+    api.runInRootSpan(options, (rootSpan) => {
+      if (!rootSpan) return;
+
+      api.wrapEmitter(stream);
+
+      const responseTraceContext =
+          api.getResponseTraceContext(options.traceContext || null, !!rootSpan);
+      if (responseTraceContext) {
+        const outHeaders: http2.OutgoingHttpHeaders = {};
+        outHeaders[api.constants.TRACE_CONTEXT_HEADER_NAME] =
+            responseTraceContext;
+        stream.additionalHeaders(outHeaders);
+      }
+
+      rootSpan.addLabel(api.labels.HTTP_METHOD_LABEL_KEY, headers[':method']);
+      rootSpan.addLabel(api.labels.HTTP_URL_LABEL_KEY, constructUrl(headers));
+      rootSpan.addLabel(
+          api.labels.HTTP_SOURCE_IP, stream.session.socket.remoteAddress);
+
+      let isResponseCodeLabelAdded = false;
+      const addResponseCodeLabel = (headers?: http2.OutgoingHttpHeaders) => {
+        if (isResponseCodeLabelAdded) return;
+        isResponseCodeLabelAdded = true;
+        rootSpan.addLabel(
+            api.labels.HTTP_RESPONSE_CODE_LABEL_KEY,
+            constructStatusCode(headers));
+      };
+
+      shimmer.wrap(
+          stream, 'respond',
+          (respond: typeof stream.respond): typeof stream.respond => {
+            return function(this: http2.ServerHttp2Stream, headers?) {
+              addResponseCodeLabel(headers);
+              return respond.apply(this, arguments);
+            };
+          });
+      shimmer.wrap(
+          stream, 'respondWithFD',
+          (respondWithFD: typeof stream.respondWithFD):
+              typeof stream.respondWithFD => {
+            return function(this: http2.ServerHttp2Stream, fd, headers?) {
+              addResponseCodeLabel(headers);
+              return respondWithFD.apply(this, arguments);
+            };
+          });
+      shimmer.wrap(
+          stream, 'respondWithFile',
+          (respondWithFile: typeof stream.respondWithFile):
+              typeof stream.respondWithFile => {
+            return function(this: http2.ServerHttp2Stream, path, headers?) {
+              addResponseCodeLabel(headers);
+              return respondWithFile.apply(this, arguments);
+            };
+          });
+      // `stream.end()` is sometimes called multiple times. A span should be
+      // ended only once.
+      let isSpanEnded = false;
+      shimmer.wrap(
+          stream, 'end', (end: typeof stream.end): typeof stream.end => {
+            return function(this: http2.ServerHttp2Stream) {
+              const result = end.apply(this, arguments);
+              // If none of `respond()`, `respondWithFD()`, or
+              // `respondWithFile()` has been called, set the response code
+              // label here with 200.
+              addResponseCodeLabel();
+              if (!isSpanEnded) {
+                isSpanEnded = true;
+                rootSpan.endSpan();
+              }
+              return result;
+            };
+          });
+    });
+  });
 }
 
 function patchHttp2(h2: NodeJS.Module, api: TraceAgent): void {
+  // Patch client side.
   shimmer.wrap(
       h2, 'connect',
       (connect: typeof http2.connect): typeof http2.connect => function(
           this: NodeJS.Module, authority: string|URL) {
         const session: http2.ClientHttp2Session =
             connect.apply(this, arguments);
-        patchHttp2Session(session, authority, api);
+        patchClientHttp2Session(session, authority, api);
         return session;
+      });
+
+  // Patch server side.
+  shimmer.wrap(
+      h2, 'createServer',
+      (createServer: typeof http2.createServer):
+          typeof http2.createServer => function(this: NodeJS.Module) {
+        const server: http2.Http2Server = createServer.apply(this, arguments);
+        patchHttp2Server(server, api);
+        return server;
+      });
+  shimmer.wrap(
+      h2, 'createSecureServer',
+      (createSecureServer: typeof http2.createSecureServer):
+          typeof http2.createSecureServer => function(this: NodeJS.Module) {
+        const server: http2.Http2SecureServer =
+            createSecureServer.apply(this, arguments);
+        patchHttp2Server(server, api);
+        return server;
       });
 }
 
 function unpatchHttp2(h2: NodeJS.Module) {
   shimmer.unwrap(h2, 'connect');
+  shimmer.unwrap(h2, 'createServer');
+  shimmer.unwrap(h2, 'createSecureServer');
 }
 
 module.exports = [

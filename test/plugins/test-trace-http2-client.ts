@@ -32,10 +32,11 @@ import {Constants} from '../../src/constants';
 import {TraceLabels} from '../../src/trace-labels';
 import {TraceSpan} from '../../src/trace-span';
 
-describe('test-trace-http2', () => {
+describe('test-trace-http2-client', () => {
   if (semver.satisfies(process.version, '<8')) {
     console.log(
-        'Skipping test-trace-http2 on Node.js version ' + process.version);
+        'Skipping test-trace-http2-client on Node.js version ' +
+        process.version);
     return;
   }
 
@@ -315,10 +316,10 @@ describe('test-trace-http2', () => {
   });
 });
 
-describe('test-trace-secure-http2', () => {
+describe('test-trace-secure-http2-client', () => {
   if (semver.satisfies(process.version, '<8')) {
     console.log(
-        'Skipping test-trace-secure-http2 on Node.js version ' +
+        'Skipping test-trace-secure-http2-client on Node.js version ' +
         process.version);
     return;
   }
